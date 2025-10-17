@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY main.py .
 
+# Copy cookies file for YouTube authentication
+COPY www.youtube.com_cookies.txt .
+
 # Create downloads directory
 RUN mkdir -p downloads
 
