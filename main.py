@@ -103,9 +103,9 @@ def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
         
         # Network optimizations
         'socket_timeout': 30,
-        'retries': 3,
-        'fragment_retries': 3,
-        'concurrent_fragment_downloads': 5,
+        'retries': 5,
+        'fragment_retries': 5,
+        'concurrent_fragment_downloads': 3,
         
         # Anti-throttling measures
         'sleep_interval': 0,
@@ -113,17 +113,24 @@ def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
         'sleep_interval_requests': 0,
         'sleep_interval_subtitles': 0,
         
-        # Bypass throttling
+        # Bypass throttling - use iOS client to avoid 403 errors
         'http_chunk_size': 10485760,  # 10MB chunks
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
-                'player_skip': ['webpage'],
+                'player_client': ['ios', 'android', 'web'],
+                'player_skip': ['webpage', 'configs'],
             }
         },
         
-        # Headers to avoid detection
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        # Headers to avoid detection - use latest Chrome user agent
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        
+        # Additional headers to mimic real browser
+        'http_headers': {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
+        },
         
         # Cookie support - use cookies file for authentication
         'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
