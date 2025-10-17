@@ -201,17 +201,31 @@ async def download_audio_progress(video_id: str, background_tasks: BackgroundTas
             video_title = info_dict.get('title', 'untitled')
             expected_mp3_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
             
-            if os.path.exists(expected_mp3_path):
-                downloaded_file = expected_mp3_path
-                logger.info(f"Successfully downloaded and converted to {expected_mp3_path}")
-                final_data = json.dumps({
-                    'status': 'completed',
-                    'title': video_title,
-                    'path': expected_mp3_path,
-                    'download_url': f"/download-file/{video_id}"
-                })
-                yield f"data: {final_data}\n\n"
-            else:
+            # Send converting status
+            converting_data = json.dumps({'status': 'converting'})
+            yield f"data: {converting_data}\n\n"
+            logger.info("Download finished, waiting for post-processing to complete...")
+            
+            # Wait for post-processing (FFmpeg conversion) to complete
+            # Poll for up to 30 seconds for the MP3 file to appear
+            max_wait_time = 30
+            wait_interval = 0.5
+            elapsed_time = 0
+            
+            while elapsed_time < max_wait_time:
+                if os.path.exists(expected_mp3_path):
+                    downloaded_file = expected_mp3_path
+                    logger.info(f"Successfully downloaded and converted to {expected_mp3_path}")
+                    final_data = json.dumps({
+                        'status': 'completed',
+                        'title': video_title,
+                        'path': expected_mp3_path,
+                        'download_url': f"/download-file/{video_id}"
+                    })
+                    yield f"data: {final_data}\n\n"
+                    return
+                
+                # Check alternative paths
                 for ext in ['.webm', '.m4a', '.ogg', '.opus']:
                     potential_path = os.path.join(DOWNLOAD_DIR, f"{video_id}{ext}.mp3")
                     if os.path.exists(potential_path):
@@ -226,12 +240,25 @@ async def download_audio_progress(video_id: str, background_tasks: BackgroundTas
                         yield f"data: {final_data}\n\n"
                         return
                 
-                logger.error(f"MP3 file not found after download: {expected_mp3_path}")
-                error_data = json.dumps({
-                    'status': 'error',
-                    'message': 'Failed to find the downloaded audio file.'
-                })
-                yield f"data: {error_data}\n\n"
+                # Wait and try again
+                await asyncio.sleep(wait_interval)
+                elapsed_time += wait_interval
+                
+                # Send periodic converting updates
+                if int(elapsed_time) % 2 == 0:
+                    converting_data = json.dumps({
+                        'status': 'converting',
+                        'elapsed': elapsed_time
+                    })
+                    yield f"data: {converting_data}\n\n"
+            
+            # Timeout - file not found
+            logger.error(f"MP3 file not found after download and {max_wait_time}s wait: {expected_mp3_path}")
+            error_data = json.dumps({
+                'status': 'error',
+                'message': 'Failed to find the downloaded audio file after conversion.'
+            })
+            yield f"data: {error_data}\n\n"
 
         except Exception as e:
             logger.error(f"Error downloading video: {e}", exc_info=True)
