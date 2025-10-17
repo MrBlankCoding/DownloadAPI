@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_DIR = "downloads"
 MAX_WORKERS = 4
 MAX_FILE_AGE_HOURS = 24  # Clean up old files after 24 hours
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), "www.youtube.com_cookies.txt")
 
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
@@ -116,17 +117,18 @@ def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
         'http_chunk_size': 10485760,  # 10MB chunks
         'extractor_args': {
             'youtube': {
-                'player_client': ['android'],
-                'player_skip': ['webpage', 'configs'],
-                'skip': ['hls', 'dash'],
+                'player_client': ['android', 'web'],
+                'player_skip': ['webpage'],
             }
         },
         
         # Headers to avoid detection
-        'user_agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        
+        # Cookie support - use cookies file for authentication
+        'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
         
         # Cache for faster repeated requests
-        'cookiefile': None,
         'no_cache_dir': False,
         
         # Skip unnecessary operations
@@ -345,6 +347,13 @@ async def get_video_info(video_id: str):
                 'no_warnings': True,
                 'extract_flat': False,
                 'skip_download': True,
+                'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android', 'web'],
+                        'player_skip': ['webpage'],
+                    }
+                },
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(video_url, download=False)
