@@ -8,6 +8,10 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
+# Setup logging first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Lifespan context manager for startup/shutdown
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -21,9 +25,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 DOWNLOAD_DIR = "downloads"
 MAX_WORKERS = 4
 MAX_FILE_AGE_HOURS = 24  # Clean up old files after 24 hours
@@ -31,6 +32,15 @@ COOKIES_FILE = os.path.join(os.path.dirname(__file__), "www.youtube.com_cookies.
 
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
+
+# Log cookie file status
+if os.path.exists(COOKIES_FILE):
+    logger.info(f"Cookie file found at: {COOKIES_FILE}")
+    logger.info(f"Cookie file size: {os.path.getsize(COOKIES_FILE)} bytes")
+else:
+    logger.warning(f"Cookie file NOT found at: {COOKIES_FILE}")
+    logger.warning(f"Current working directory: {os.getcwd()}")
+    logger.warning(f"__file__ location: {os.path.dirname(__file__)}")
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -127,7 +137,7 @@ def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
             "Sec-Fetch-Mode": "navigate",
         },
         # Cookie support - use cookies file for authentication
-        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+        "cookiefile": COOKIES_FILE,
         # Cache for faster repeated requests
         "no_cache_dir": False,
         # Skip unnecessary operations
@@ -327,7 +337,7 @@ async def get_video_info(video_id: str):
                 "no_warnings": True,
                 "extract_flat": False,
                 "skip_download": True,
-                "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+                "cookiefile": COOKIES_FILE,
                 "extractor_args": {
                     "youtube": {
                         "player_client": ["android", "web"],
