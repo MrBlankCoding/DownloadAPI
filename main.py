@@ -98,7 +98,7 @@ def cleanup_old_files():
 
 def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "format": "bestaudio/best",
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -348,7 +348,6 @@ async def get_video_info(video_id: str):
 
         def extract_info():
             ydl_opts = {
-                "format": "bestaudio/best",
                 "quiet": True,
                 "no_warnings": True,
                 "extract_flat": False,
