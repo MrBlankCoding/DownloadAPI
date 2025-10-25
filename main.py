@@ -136,10 +136,11 @@ def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
         "sleep_interval_subtitles": 0,
         # Bypass throttling - use iOS client to avoid 403 errors
         "http_chunk_size": 10485760,  # 10MB chunks
+        "allow_unplayable_formats": False,
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "android", "web"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["ios"],  # iOS client works best for restricted content
+                "player_skip": ["configs"],
                 "po_token": [PO_TOKEN] if PO_TOKEN else None,
                 "visitor_data": [VISITOR_DATA] if VISITOR_DATA else None,
             }
