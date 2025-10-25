@@ -30,6 +30,10 @@ MAX_WORKERS = 4
 MAX_FILE_AGE_HOURS = 24  # Clean up old files after 24 hours
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "www.youtube.com_cookies.txt")
 
+# YouTube authentication tokens (hardcoded for private deployment)
+PO_TOKEN = os.getenv("YT_PO_TOKEN", "QUFFLUhqa3l5eW9wNG1zc3lNQlBOZGhkeThBeHhoS2ZKd3w=")  # Proof of Origin token
+VISITOR_DATA = os.getenv("YT_VISITOR_DATA", "CgtKd0c5M05MMTRPZyi2mfXHBjIKCgJVUxIEGgAgbQ%3D%3D")  # Visitor data token
+
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
 
@@ -41,6 +45,16 @@ else:
     logger.warning(f"Cookie file NOT found at: {COOKIES_FILE}")
     logger.warning(f"Current working directory: {os.getcwd()}")
     logger.warning(f"__file__ location: {os.path.dirname(__file__)}")
+
+# Log authentication token status
+if PO_TOKEN:
+    logger.info(f"PO_TOKEN configured (length: {len(PO_TOKEN)})")
+else:
+    logger.warning("PO_TOKEN not set - YouTube may require this for authentication")
+if VISITOR_DATA:
+    logger.info(f"VISITOR_DATA configured (length: {len(VISITOR_DATA)})")
+else:
+    logger.warning("VISITOR_DATA not set - YouTube may require this for authentication")
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -126,6 +140,8 @@ def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
             "youtube": {
                 "player_client": ["ios", "android", "web"],
                 "player_skip": ["webpage", "configs"],
+                "po_token": [PO_TOKEN] if PO_TOKEN else None,
+                "visitor_data": [VISITOR_DATA] if VISITOR_DATA else None,
             }
         },
         # Headers to avoid detection - use latest Chrome user agent
@@ -342,6 +358,8 @@ async def get_video_info(video_id: str):
                     "youtube": {
                         "player_client": ["android", "web"],
                         "player_skip": ["webpage"],
+                        "po_token": [PO_TOKEN] if PO_TOKEN else None,
+                        "visitor_data": [VISITOR_DATA] if VISITOR_DATA else None,
                     }
                 },
             }
