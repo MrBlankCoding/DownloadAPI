@@ -80,67 +80,49 @@ def cleanup_old_files():
         logger.error(f"Error during cleanup: {e}")
 
 
-def get_base_ydl_opts():
-    """Get base yt-dlp options that work reliably"""
+def get_enhanced_ydl_opts(for_download=True, include_progress_hook=None):
+    """
+    Get yt-dlp options with proven YouTube extraction strategy.
+    Uses default behavior with minimal interference.
+    """
     opts = {
-        # Basic options
+        # Core settings - let yt-dlp use its defaults
         "quiet": False,
         "no_warnings": False,
         "no_color": True,
         "noplaylist": True,
-        
-        # Network options
         "nocheckcertificate": True,
+        
+        # Network settings
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
-        
-        # Use cookies if available
-        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
-        
-        # Basic headers to avoid detection
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
-    return opts
-
-
-def get_download_ydl_opts(video_id: str, include_progress_hook=None):
-    """Get yt-dlp options for downloading with audio extraction"""
-    opts = get_base_ydl_opts()
     
     # Add download-specific options
-    opts.update({
-        "format": "bestaudio/best",
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            },
-            {
-                "key": "FFmpegMetadata",
-                "add_metadata": True,
-            },
-        ],
-        "writethumbnail": True,
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-    })
-    
-    if include_progress_hook:
-        opts["progress_hooks"] = [include_progress_hook]
-
-    return opts
-
-
-def get_info_ydl_opts():
-    """Get yt-dlp options for extracting video info only"""
-    opts = get_base_ydl_opts()
-    
-    # Add info-specific options
-    opts.update({
-        "skip_download": True,
-        "quiet": True,
-    })
+    if for_download:
+        opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                },
+                {
+                    "key": "FFmpegMetadata",
+                    "add_metadata": True,
+                },
+            ],
+            "writethumbnail": True,
+            "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+        })
+        
+        if include_progress_hook:
+            opts["progress_hooks"] = [include_progress_hook]
+    else:
+        # Info extraction only
+        opts["skip_download"] = True
     
     return opts
 
@@ -183,7 +165,7 @@ async def download_audio_progress(video_id: str, background_tasks: BackgroundTas
                     "total_bytes": d.get("total_bytes", 0),
                 }
 
-        ydl_opts = get_download_ydl_opts(video_id, include_progress_hook=progress_hook)
+        ydl_opts = get_enhanced_ydl_opts(for_download=True, include_progress_hook=progress_hook)
 
         try:
             loop = asyncio.get_event_loop()
@@ -323,7 +305,7 @@ async def get_video_info(video_id: str):
         loop = asyncio.get_event_loop()
 
         def extract_info():
-            ydl_opts = get_info_ydl_opts()
+            ydl_opts = get_enhanced_ydl_opts(for_download=False)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(video_url, download=False)
 
@@ -347,17 +329,6 @@ async def get_video_info(video_id: str):
         logger.error(f"Error fetching video info: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/cleanup")
-async def manual_cleanup():
-    """Manual endpoint to trigger cleanup of old files"""
-    try:
-        cleanup_old_files()
-        return {"message": "Cleanup completed successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
@@ -366,4 +337,4 @@ async def health_check():
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the Simplified Music Downloader API"}
+    return {"message": "Welcome to the Enhanced Music Downloader API"}

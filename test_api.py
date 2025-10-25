@@ -8,7 +8,7 @@ from main import app, DOWNLOAD_DIR
 client = TestClient(app)
 
 # Test with a reliable, non-restricted video (YouTube's "Me at the zoo" - first YouTube video)
-TEST_VIDEO_ID = "jNQXAC9IVRw"
+TEST_VIDEO_ID = "0Wa_CR0H8g4"
 
 def test_download_video():
     """Test downloading a video and verify the download process"""
