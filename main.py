@@ -30,10 +30,6 @@ MAX_WORKERS = 4
 MAX_FILE_AGE_HOURS = 24  # Clean up old files after 24 hours
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "www.youtube.com_cookies.txt")
 
-# YouTube authentication tokens (hardcoded for private deployment)
-PO_TOKEN = os.getenv("YT_PO_TOKEN", "QUFFLUhqa3l5eW9wNG1zc3lNQlBOZGhkeThBeHhoS2ZKd3w=")  # Proof of Origin token
-VISITOR_DATA = os.getenv("YT_VISITOR_DATA", "CgtKd0c5M05MMTRPZyi2mfXHBjIKCgJVUxIEGgAgbQ%3D%3D")  # Visitor data token
-
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
 
@@ -43,18 +39,6 @@ if os.path.exists(COOKIES_FILE):
     logger.info(f"Cookie file size: {os.path.getsize(COOKIES_FILE)} bytes")
 else:
     logger.warning(f"Cookie file NOT found at: {COOKIES_FILE}")
-    logger.warning(f"Current working directory: {os.getcwd()}")
-    logger.warning(f"__file__ location: {os.path.dirname(__file__)}")
-
-# Log authentication token status
-if PO_TOKEN:
-    logger.info(f"PO_TOKEN configured (length: {len(PO_TOKEN)})")
-else:
-    logger.warning("PO_TOKEN not set - YouTube may require this for authentication")
-if VISITOR_DATA:
-    logger.info(f"VISITOR_DATA configured (length: {len(VISITOR_DATA)})")
-else:
-    logger.warning("VISITOR_DATA not set - YouTube may require this for authentication")
 
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -96,8 +80,36 @@ def cleanup_old_files():
         logger.error(f"Error during cleanup: {e}")
 
 
-def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
+def get_base_ydl_opts():
+    """Get base yt-dlp options that work reliably"""
     opts = {
+        # Basic options
+        "quiet": False,
+        "no_warnings": False,
+        "no_color": True,
+        "noplaylist": True,
+        
+        # Network options
+        "nocheckcertificate": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        
+        # Use cookies if available
+        "cookiefile": COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+        
+        # Basic headers to avoid detection
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    return opts
+
+
+def get_download_ydl_opts(video_id: str, include_progress_hook=None):
+    """Get yt-dlp options for downloading with audio extraction"""
+    opts = get_base_ydl_opts()
+    
+    # Add download-specific options
+    opts.update({
         "format": "bestaudio/best",
         "postprocessors": [
             {
@@ -106,66 +118,30 @@ def get_optimized_ydl_opts(video_id: str, include_progress_hook=None):
                 "preferredquality": "192",
             },
             {
-                "key": "EmbedThumbnail",
-                "already_have_thumbnail": False,
-            },
-            {
                 "key": "FFmpegMetadata",
                 "add_metadata": True,
             },
         ],
-        # Download thumbnail for embedding
         "writethumbnail": True,
-        # Output template
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        # Performance optimizations
-        "noplaylist": True,
-        "nocheckcertificate": True,
-        "no_warnings": True,
-        "quiet": False,
-        "no_color": True,
-        # Network optimizations
-        "socket_timeout": 30,
-        "retries": 5,
-        "fragment_retries": 5,
-        "concurrent_fragment_downloads": 3,
-        # Anti-throttling measures
-        "sleep_interval": 0,
-        "max_sleep_interval": 0,
-        "sleep_interval_requests": 0,
-        "sleep_interval_subtitles": 0,
-        # Bypass throttling - use iOS client to avoid 403 errors
-        "http_chunk_size": 10485760,  # 10MB chunks
-        "allow_unplayable_formats": False,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios"],  # iOS client works best for restricted content
-                "player_skip": ["configs"],
-                "po_token": [PO_TOKEN] if PO_TOKEN else None,
-                "visitor_data": [VISITOR_DATA] if VISITOR_DATA else None,
-            }
-        },
-        # Headers to avoid detection - use latest Chrome user agent
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        # Additional headers to mimic real browser
-        "http_headers": {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-us,en;q=0.5",
-            "Sec-Fetch-Mode": "navigate",
-        },
-        # Cookie support - use cookies file for authentication
-        "cookiefile": COOKIES_FILE,
-        # Cache for faster repeated requests
-        "no_cache_dir": False,
-        # Skip unnecessary operations
-        "skip_download": False,
-        "extract_flat": False,
-        "simulate": False,
-    }
-
+    })
+    
     if include_progress_hook:
         opts["progress_hooks"] = [include_progress_hook]
 
+    return opts
+
+
+def get_info_ydl_opts():
+    """Get yt-dlp options for extracting video info only"""
+    opts = get_base_ydl_opts()
+    
+    # Add info-specific options
+    opts.update({
+        "skip_download": True,
+        "quiet": True,
+    })
+    
     return opts
 
 
@@ -207,7 +183,7 @@ async def download_audio_progress(video_id: str, background_tasks: BackgroundTas
                     "total_bytes": d.get("total_bytes", 0),
                 }
 
-        ydl_opts = get_optimized_ydl_opts(video_id, include_progress_hook=progress_hook)
+        ydl_opts = get_download_ydl_opts(video_id, include_progress_hook=progress_hook)
 
         try:
             loop = asyncio.get_event_loop()
@@ -234,7 +210,6 @@ async def download_audio_progress(video_id: str, background_tasks: BackgroundTas
             logger.info("Download finished, waiting for post-processing to complete...")
 
             # Wait for post-processing (FFmpeg conversion) to complete
-            # Poll for up to 30 seconds for the MP3 file to appear
             max_wait_time = 30
             wait_interval = 0.5
             elapsed_time = 0
@@ -348,21 +323,7 @@ async def get_video_info(video_id: str):
         loop = asyncio.get_event_loop()
 
         def extract_info():
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "extract_flat": False,
-                "skip_download": True,
-                "cookiefile": COOKIES_FILE,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["android", "web"],
-                        "player_skip": ["webpage"],
-                        "po_token": [PO_TOKEN] if PO_TOKEN else None,
-                        "visitor_data": [VISITOR_DATA] if VISITOR_DATA else None,
-                    }
-                },
-            }
+            ydl_opts = get_info_ydl_opts()
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(video_url, download=False)
 
@@ -400,13 +361,9 @@ async def manual_cleanup():
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
-    return {
-        "status": "healthy",
-        "download_dir": DOWNLOAD_DIR,
-        "max_workers": MAX_WORKERS,
-    }
+    return {"status": "healthy"}
 
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the Optimized Music Downloader API"}
+    return {"message": "Welcome to the Simplified Music Downloader API"}
