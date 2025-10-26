@@ -1,3 +1,4 @@
+# Use lightweight Python 3.11 image
 FROM python:3.11-slim
 
 # Install FFmpeg
@@ -9,7 +10,7 @@ RUN apt-get update && \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
+# Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -22,8 +23,11 @@ COPY www.youtube.com_cookies.txt .
 # Create downloads directory
 RUN mkdir -p downloads
 
-# Expose port (Koyeb uses PORT env variable)
+# Expose port (Koyeb or any platform uses PORT env variable)
 EXPOSE 8000
 
-# Start the application
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Set environment variable for cookies file
+ENV YOUTUBE_COOKIES=www.youtube.com_cookies.txt
+
+# Start the application with Uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

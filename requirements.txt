@@ -1,6 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
+google-api-python-client
 yt-dlp
-pytest
-pytest-asyncio
-httpx
+python-dotenv
+slowapi

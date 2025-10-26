@@ -1,340 +1,321 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, StreamingResponse
-import yt_dlp
 import os
-import logging
+import tempfile
 import asyncio
-import json
-from concurrent.futures import ThreadPoolExecutor
+import logging
+from pathlib import Path
+from typing import List
 from contextlib import asynccontextmanager
 
-# Setup logging first
-logging.basicConfig(level=logging.INFO)
+from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from concurrent.futures import ThreadPoolExecutor
+import yt_dlp
+from pydantic import BaseModel, Field
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Lifespan context manager for startup/shutdown
+# Load environment variables
+load_dotenv()
+
+# Configuration
+class Config:
+    YOUTUBE_API_KEY: str = os.getenv("YOUTUBE_API_KEY", "")
+    COOKIES_FILE: str = os.getenv("YOUTUBE_COOKIES", "www.youtube.com_cookies.txt")
+    DOWNLOAD_DIR: Path = Path("downloads")
+    MAX_WORKERS: int = 5
+    SEARCH_RATE_LIMIT: str = "10/minute"
+    DOWNLOAD_RATE_LIMIT: str = "5/minute"
+    MAX_SEARCH_RESULTS: int = 5
+    
+    @classmethod
+    def validate(cls):
+        if not cls.YOUTUBE_API_KEY:
+            raise RuntimeError("Missing YOUTUBE_API_KEY in .env file")
+        cls.DOWNLOAD_DIR.mkdir(exist_ok=True)
+        if not Path(cls.COOKIES_FILE).exists():
+            logger.warning(f"Cookies file not found: {cls.COOKIES_FILE}")
+
+Config.validate()
+
+# Pydantic models
+class VideoInfo(BaseModel):
+    title: str
+    video_id: str = Field(alias="videoId")
+    channel_title: str = Field(alias="channelTitle")
+    thumbnail: str
+    duration: str
+    
+    class Config:
+        populate_by_name = True
+
+class SearchResponse(BaseModel):
+    videos: List[VideoInfo]
+    query: str
+    count: int
+
+# Global executor (initialized before lifespan)
+executor = ThreadPoolExecutor(max_workers=Config.MAX_WORKERS)
+
+# Lifespan context manager for cleanup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    logger.info("Starting up application...")
+    logger.info("Starting up Music Downloader API...")
     yield
     # Shutdown
-    logger.info("Shutting down application...")
+    logger.info("Shutting down... cleaning up resources")
     executor.shutdown(wait=True)
 
+# Initialize FastAPI app
+app = FastAPI(
+    title="Music Downloader API",
+    version="2.2",
+    description="API for searching and downloading music from YouTube",
+    lifespan=lifespan
+)
 
-app = FastAPI(lifespan=lifespan)
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-DOWNLOAD_DIR = "downloads"
-MAX_WORKERS = 4
-MAX_FILE_AGE_HOURS = 24  # Clean up old files after 24 hours
-COOKIES_FILE = os.path.join(os.path.dirname(__file__), "www.youtube.com_cookies.txt")
+# Initialize services
+try:
+    youtube_service = build("youtube", "v3", developerKey=Config.YOUTUBE_API_KEY)
+except Exception as e:
+    logger.error(f"Failed to initialize YouTube service: {e}")
+    raise
 
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Log cookie file status
-if os.path.exists(COOKIES_FILE):
-    logger.info(f"Cookie file found at: {COOKIES_FILE}")
-    logger.info(f"Cookie file size: {os.path.getsize(COOKIES_FILE)} bytes")
-else:
-    logger.warning(f"Cookie file NOT found at: {COOKIES_FILE}")
+# -------------------------
+# Helper Functions
+# -------------------------
 
-executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
-
-def cleanup_file(file_path: str):
-    """Background task to delete file after response is sent"""
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Deleted file: {file_path}")
-
-            # Also clean up any thumbnail files
-            base_path = os.path.splitext(file_path)[0]
-            for ext in [".jpg", ".png", ".webp"]:
-                thumb_path = f"{base_path}{ext}"
-                if os.path.exists(thumb_path):
-                    os.remove(thumb_path)
-                    logger.info(f"Deleted thumbnail: {thumb_path}")
-    except Exception as e:
-        logger.error(f"Error deleting file {file_path}: {e}")
-
-
-def cleanup_old_files():
-    """Clean up files older than MAX_FILE_AGE_HOURS"""
-    try:
-        import time
-
-        current_time = time.time()
-        max_age_seconds = MAX_FILE_AGE_HOURS * 3600
-
-        for filename in os.listdir(DOWNLOAD_DIR):
-            file_path = os.path.join(DOWNLOAD_DIR, filename)
-            if os.path.isfile(file_path):
-                file_age = current_time - os.path.getmtime(file_path)
-                if file_age > max_age_seconds:
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up old file: {filename}")
-    except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
-
-
-def get_enhanced_ydl_opts(for_download=True, include_progress_hook=None):
-    """
-    Get yt-dlp options with proven YouTube extraction strategy.
-    Uses default behavior with minimal interference.
-    """
-    opts = {
-        # Core settings - let yt-dlp use its defaults
-        "quiet": False,
-        "no_warnings": False,
-        "no_color": True,
-        "noplaylist": True,
-        "nocheckcertificate": True,
-        
-        # Network settings
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
+def get_ydl_options(temp_dir: str) -> dict:
+    """Get yt-dlp options configuration."""
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(temp_dir, "%(title)s.%(ext)s"),
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192"
+            },
+            {"key": "EmbedThumbnail"},
+            {"key": "FFmpegMetadata"},
+        ],
+        "writethumbnail": True,
+        "addmetadata": True,
+        "quiet": True,
+        "no_warnings": True,
     }
     
-    # Add download-specific options
-    if for_download:
-        opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                },
-                {
-                    "key": "FFmpegMetadata",
-                    "add_metadata": True,
-                },
-            ],
-            "writethumbnail": True,
-            "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        })
-        
-        if include_progress_hook:
-            opts["progress_hooks"] = [include_progress_hook]
-    else:
-        # Info extraction only
-        opts["skip_download"] = True
+    # Only add cookies if file exists
+    if Path(Config.COOKIES_FILE).exists():
+        options["cookies"] = Config.COOKIES_FILE
     
-    return opts
+    return options
 
+def download_audio_sync(video_id: str) -> str:
+    """Synchronous download using yt-dlp with cookies support."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    temp_dir = tempfile.mkdtemp(dir=Config.DOWNLOAD_DIR)
+    
+    logger.info(f"Starting download for video ID: {video_id}")
+    print(f"Starting download for video ID: {video_id}")
+    
+    try:
+        ydl_opts = get_ydl_options(temp_dir)
+        print(f"ydl_opts: {ydl_opts}")
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # Get the base filename and replace extension with .mp3
+            base_filename = ydl.prepare_filename(info)
+            filename = os.path.splitext(base_filename)[0] + ".mp3"
+        
+        logger.info(f"Download completed: {filename}")
+        print(f"Download completed: {filename}")
+        return filename
+    except Exception as e:
+        logger.error(f"Download failed for {video_id}: {e}")
+        print(f"Download failed for {video_id}: {e}")
+        # Clean up temp directory on failure
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
-@app.get("/download-progress/{video_id}")
-async def download_audio_progress(video_id: str, background_tasks: BackgroundTasks):
-    """Stream download progress using Server-Sent Events, then delete file"""
-    logger.info(f"Received download request for video_id: {video_id}")
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
+async def download_audio_async(video_id: str) -> str:
+    """Asynchronous wrapper for download_audio_sync."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, download_audio_sync, video_id)
 
-    # Clean up old files before starting new download
-    cleanup_old_files()
-
-    async def event_generator():
-        progress_data = {
-            "status": "starting",
-            "downloaded_bytes": 0,
-            "total_bytes": 0,
-            "speed": 0,
-            "eta": 0,
-        }
-        downloaded_file = None
-
-        def progress_hook(d):
-            nonlocal progress_data
-            if d["status"] == "downloading":
-                progress_data = {
-                    "status": "downloading",
-                    "downloaded_bytes": d.get("downloaded_bytes", 0),
-                    "total_bytes": d.get("total_bytes", 0)
-                    or d.get("total_bytes_estimate", 0),
-                    "speed": d.get("speed", 0),
-                    "eta": d.get("eta", 0),
-                    "percent": d.get("_percent_str", "0%").strip(),
-                }
-            elif d["status"] == "finished":
-                progress_data = {
-                    "status": "finished",
-                    "downloaded_bytes": d.get("downloaded_bytes", 0),
-                    "total_bytes": d.get("total_bytes", 0),
-                }
-
-        ydl_opts = get_enhanced_ydl_opts(for_download=True, include_progress_hook=progress_hook)
-
-        try:
-            loop = asyncio.get_event_loop()
-
-            def download():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info_dict = ydl.extract_info(video_url, download=True)
-                    return info_dict
-
-            download_task = loop.run_in_executor(executor, download)
-
-            while not download_task.done():
-                data = json.dumps(progress_data)
-                yield f"data: {data}\n\n"
-                await asyncio.sleep(0.3)
-
-            info_dict = await download_task
-            video_title = info_dict.get("title", "untitled")
-            expected_mp3_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-
-            # Send converting status
-            converting_data = json.dumps({"status": "converting"})
-            yield f"data: {converting_data}\n\n"
-            logger.info("Download finished, waiting for post-processing to complete...")
-
-            # Wait for post-processing (FFmpeg conversion) to complete
-            max_wait_time = 30
-            wait_interval = 0.5
-            elapsed_time = 0
-
-            while elapsed_time < max_wait_time:
-                if os.path.exists(expected_mp3_path):
-                    downloaded_file = expected_mp3_path
-                    logger.info(
-                        f"Successfully downloaded and converted to {expected_mp3_path}"
-                    )
-                    final_data = json.dumps(
-                        {
-                            "status": "completed",
-                            "title": video_title,
-                            "path": expected_mp3_path,
-                            "download_url": f"/download-file/{video_id}",
-                        }
-                    )
-                    yield f"data: {final_data}\n\n"
-                    return
-
-                # Check alternative paths
-                for ext in [".webm", ".m4a", ".ogg", ".opus"]:
-                    potential_path = os.path.join(DOWNLOAD_DIR, f"{video_id}{ext}.mp3")
-                    if os.path.exists(potential_path):
-                        downloaded_file = potential_path
-                        logger.info(
-                            f"Successfully downloaded and converted to {potential_path}"
-                        )
-                        final_data = json.dumps(
-                            {
-                                "status": "completed",
-                                "title": video_title,
-                                "path": potential_path,
-                                "download_url": f"/download-file/{video_id}",
-                            }
-                        )
-                        yield f"data: {final_data}\n\n"
-                        return
-
-                # Wait and try again
-                await asyncio.sleep(wait_interval)
-                elapsed_time += wait_interval
-
-                # Send periodic converting updates
-                if int(elapsed_time) % 2 == 0:
-                    converting_data = json.dumps(
-                        {"status": "converting", "elapsed": elapsed_time}
-                    )
-                    yield f"data: {converting_data}\n\n"
-
-            # Timeout - file not found
-            logger.error(
-                f"MP3 file not found after download and {max_wait_time}s wait: {expected_mp3_path}"
-            )
-            error_data = json.dumps(
-                {
-                    "status": "error",
-                    "message": "Failed to find the downloaded audio file after conversion.",
-                }
-            )
-            yield f"data: {error_data}\n\n"
-
-        except Exception as e:
-            logger.error(f"Error downloading video: {e}", exc_info=True)
-            error_data = json.dumps({"status": "error", "message": str(e)})
-            yield f"data: {error_data}\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.get("/download-file/{video_id}")
-async def download_file(video_id: str, background_tasks: BackgroundTasks):
-    """Download the file and delete it after sending"""
-    expected_mp3_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-
-    if os.path.exists(expected_mp3_path):
-        # Schedule file deletion after response is sent
-        background_tasks.add_task(cleanup_file, expected_mp3_path)
-        return FileResponse(
-            expected_mp3_path, media_type="audio/mpeg", filename=f"{video_id}.mp3"
-        )
-
-    # Check alternative paths
-    for ext in [".webm", ".m4a", ".ogg", ".opus"]:
-        potential_path = os.path.join(DOWNLOAD_DIR, f"{video_id}{ext}.mp3")
-        if os.path.exists(potential_path):
-            background_tasks.add_task(cleanup_file, potential_path)
-            return FileResponse(
-                potential_path, media_type="audio/mpeg", filename=f"{video_id}.mp3"
-            )
-
-    raise HTTPException(status_code=404, detail="File not found")
-
-
-@app.get("/video-info/{video_id}")
-async def get_video_info(video_id: str):
-    """Get video metadata without downloading"""
-    logger.info(f"Fetching info for video_id: {video_id}")
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
+async def get_video_details(video_id: str) -> str:
+    """Asynchronously fetch video duration from YouTube API."""
     try:
         loop = asyncio.get_event_loop()
-
-        def extract_info():
-            ydl_opts = get_enhanced_ydl_opts(for_download=False)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(video_url, download=False)
-
-        info_dict = await loop.run_in_executor(executor, extract_info)
-
-        thumbnail_url = None
-        thumbnails = info_dict.get("thumbnails", [])
-        if thumbnails:
-            thumbnail_url = thumbnails[-1].get("url", "")
-
-        return {
-            "video_id": video_id,
-            "title": info_dict.get("title", "Unknown"),
-            "artist": info_dict.get("artist") or info_dict.get("uploader", "Unknown"),
-            "channel": info_dict.get("channel", "Unknown"),
-            "thumbnail_url": thumbnail_url,
-            "duration": info_dict.get("duration", 0),
-        }
-
+        details = await loop.run_in_executor(
+            executor,
+            lambda: youtube_service.videos().list(  # pylint: disable=no-member
+                part="contentDetails", id=video_id
+            ).execute()
+        )
+        
+        items = details.get("items", [])
+        if items:
+            content_details = items[0].get("contentDetails", {})
+            duration = content_details.get("duration", "Unknown")
+            return duration
+        
+        logger.warning(f"No items found for video ID: {video_id}")
+        return "Unknown"
+        
+    except HttpError as e:
+        logger.error(f"YouTube API HttpError for {video_id}: {e}")
+        return "Unknown"
     except Exception as e:
-        logger.error(f"Error fetching video info: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Unexpected error fetching details for {video_id}: {e}")
+        return "Unknown"
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for monitoring"""
-    return {"status": "healthy"}
+# -------------------------
+# Routes
+# -------------------------
 
+@app.get("/", tags=["Health"])
+def root():
+    """Health check endpoint."""
+    return {
+        "status": "online",
+        "message": "Music Downloader API is running",
+        "version": "2.2"
+    }
 
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Enhanced Music Downloader API"}
+@app.get("/health", tags=["Health"])
+def health_check():
+    """Detailed health check."""
+    return {
+        "status": "healthy",
+        "youtube_api": "connected" if Config.YOUTUBE_API_KEY else "not configured",
+        "cookies": "available" if Path(Config.COOKIES_FILE).exists() else "not found"
+    }
+
+@app.get("/search", response_model=SearchResponse, tags=["Search"])
+@limiter.limit(Config.SEARCH_RATE_LIMIT)
+async def search_song(
+    request: Request,
+    query: str = Query(..., description="Search query for the song", min_length=1)
+):
+    """
+    Search for songs on YouTube.
+    
+    - **query**: Search term (e.g., artist name, song title)
+    - Returns up to 5 video results with metadata
+    """
+    logger.info(f"Search request: '{query}' from {get_remote_address(request)}")
+    
+    try:
+        search_request = youtube_service.search().list(
+            part="snippet",  # pylint: disable=no-member
+            q=query,
+            maxResults=Config.MAX_SEARCH_RESULTS,
+            type="video",
+            videoCategoryId="10",  # Music category
+            safeSearch="moderate"
+        )
+        response = search_request.execute()
+    except HttpError as e:
+        logger.error(f"YouTube API error during search: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="YouTube API service temporarily unavailable"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error during search: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    videos = []
+    for item in response.get("items", []):
+        video_id = item["id"]["videoId"]
+        snippet = item["snippet"]
+        duration = await get_video_details(video_id)
+
+        videos.append(VideoInfo(
+            title=snippet["title"],
+            videoId=video_id,
+            channelTitle=snippet["channelTitle"],
+            thumbnail=snippet["thumbnails"]["high"]["url"],
+            duration=duration
+        ))
+
+    return SearchResponse(videos=videos, query=query, count=len(videos))
+
+@app.get("/download/{video_id}", tags=["Download"])
+@limiter.limit(Config.DOWNLOAD_RATE_LIMIT)
+async def download_audio(
+    video_id: str,
+    request: Request
+):
+    """
+    Download audio from a YouTube video.
+    
+    - **video_id**: YouTube video ID (e.g., 'dQw4w9WgXcQ')
+    - Returns MP3 file
+    """
+    logger.info(f"Download request for {video_id} from {get_remote_address(request)}")
+    print(f"Download request for {video_id}")
+    
+    # Basic validation
+    if not video_id or len(video_id) != 11:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    
+    try:
+        filename = await download_audio_async(video_id)
+        print(f"filename: {filename}")
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"yt-dlp download error: {e}")
+        print(f"yt-dlp download error: {e}")
+        raise HTTPException(
+            status_code=404,
+            detail="Video not found or unavailable for download"
+        )
+    except Exception as e:
+        logger.error(f"Download failed for {video_id}: {e}")
+        print(f"Download failed for {video_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Download failed: {str(e)}"
+        )
+
+    if not os.path.exists(filename):
+        print(f"File not created: {filename}")
+        raise HTTPException(status_code=500, detail="File was not created")
+
+    return FileResponse(
+        filename,
+        media_type="audio/mpeg",
+        filename=os.path.basename(filename),
+        headers={"Content-Disposition": f"attachment; filename={os.path.basename(filename)}"}
+    )
+
+# Run with: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
