@@ -49,8 +49,6 @@ class Config:
         if not Path(cls.COOKIES_FILE).exists():
             logger.warning(f"Cookies file not found: {cls.COOKIES_FILE}")
 
-Config.validate()
-
 # Pydantic models
 class VideoInfo(BaseModel):
     title: str
@@ -184,8 +182,16 @@ task_manager = DownloadTaskManager(max_concurrent=2)
 # Lifespan context manager for cleanup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger.info("Starting up Music Downloader API...")
+    
+    # Validate config here (runtime-safe)
+    try:
+        Config.validate()
+        logger.info("Configuration validated successfully.")
+    except Exception as e:
+        logger.error(f"Configuration validation failed: {e}")
+        raise
+
     global youtube_service
     try:
         youtube_service = build("youtube", "v3", developerKey=Config.YOUTUBE_API_KEY)
@@ -193,10 +199,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize YouTube service: {e}")
         raise
+
     yield
-    # Shutdown
+
     logger.info("Shutting down... cleaning up resources")
     executor.shutdown(wait=True)
+
 
 # Initialize FastAPI app
 app = FastAPI(
