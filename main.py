@@ -18,6 +18,8 @@ from slowapi.errors import RateLimitExceeded
 from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 from pydantic import BaseModel, Field
+import json
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -60,13 +62,124 @@ class VideoInfo(BaseModel):
     class Config:
         populate_by_name = True
 
+class PlaylistInfo(BaseModel):
+    title: str
+    playlist_id: str = Field(alias="playlistId")
+    channel_title: str = Field(alias="channelTitle")
+    thumbnail: str
+    video_count: str = Field(alias="videoCount")
+    
+    class Config:
+        populate_by_name = True
+
 class SearchResponse(BaseModel):
     videos: List[VideoInfo]
     query: str
     count: int
 
+class PlaylistSearchResponse(BaseModel):
+    playlists: List[PlaylistInfo]
+    query: str
+    count: int
+
+class PlaylistDownloadRequest(BaseModel):
+    playlist_id: str
+    title: str
+    thumbnail: str
+    channel_title: str
+
 # Global executor (initialized before lifespan)
 executor = ThreadPoolExecutor(max_workers=Config.MAX_WORKERS)
+
+# Playlist storage
+class PlaylistStorage:
+    def __init__(self):
+        self.storage_file = Config.DOWNLOAD_DIR / "playlists.json"
+        self.storage_file.parent.mkdir(exist_ok=True)
+        self._playlists = {}
+        self._load()
+    
+    def _load(self):
+        if self.storage_file.exists():
+            try:
+                with open(self.storage_file, 'r') as f:
+                    self._playlists = json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading playlists: {e}")
+                self._playlists = {}
+    
+    def _save(self):
+        try:
+            with open(self.storage_file, 'w') as f:
+                json.dump(self._playlists, f)
+        except Exception as e:
+            logger.error(f"Error saving playlists: {e}")
+    
+    def create_playlist(self, playlist_id: str, title: str, thumbnail: str, channel_title: str):
+        self._playlists[playlist_id] = {
+            "id": playlist_id,
+            "title": title,
+            "thumbnail": thumbnail,
+            "channel_title": channel_title,
+            "songs": [],
+            "created_at": datetime.now().isoformat(),
+            "status": "downloading"
+        }
+        self._save()
+    
+    def add_song_to_playlist(self, playlist_id: str, song_data: dict):
+        if playlist_id in self._playlists:
+            self._playlists[playlist_id]["songs"].append(song_data)
+            self._save()
+    
+    def complete_playlist(self, playlist_id: str):
+        if playlist_id in self._playlists:
+            self._playlists[playlist_id]["status"] = "completed"
+            self._save()
+    
+    def get_playlist(self, playlist_id: str):
+        return self._playlists.get(playlist_id)
+    
+    def get_all_playlists(self):
+        return list(self._playlists.values())
+
+# Download task manager
+class DownloadTaskManager:
+    def __init__(self, max_concurrent=2):
+        self.max_concurrent = max_concurrent
+        self.tasks = {}
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def download_playlist_songs(self, playlist_id: str, video_ids: List[str], temp_dir: str):
+        """Download playlist songs with concurrency control."""
+        completed = 0
+        total = len(video_ids)
+        
+        async def download_with_limit(video_id: str, index: int):
+            async with self.semaphore:
+                try:
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    logger.info(f"Downloading song {index+1}/{total} from playlist {playlist_id}")
+                    
+                    ydl_opts = get_ydl_options(temp_dir)
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        base_filename = ydl.prepare_filename(info)
+                        filename = os.path.splitext(base_filename)[0] + ".mp3"
+                    
+                    logger.info(f"Completed download {index+1}/{total}: {filename}")
+                    return filename
+                except Exception as e:
+                    logger.error(f"Download failed for {video_id}: {e}")
+                    return None
+        
+        tasks = [download_with_limit(vid, idx) for idx, vid in enumerate(video_ids)]
+        results = await asyncio.gather(*tasks)
+        
+        return [r for r in results if r is not None]
+
+playlist_storage = PlaylistStorage()
+task_manager = DownloadTaskManager(max_concurrent=2)
 
 # Lifespan context manager for cleanup
 @asynccontextmanager
@@ -136,6 +249,29 @@ def get_ydl_options(temp_dir: str) -> dict:
         options["cookies"] = Config.COOKIES_FILE
     
     return options
+
+
+def get_thumbnail_url(thumbnails: dict) -> str:
+    """Return the best available thumbnail URL from a YouTube snippet thumbnails dict.
+
+    Tries a list of preferred keys ('high', 'standard', 'medium', 'default') and
+    falls back to the first available thumbnail entry. Returns empty string when
+    nothing is available.
+    """
+    if not thumbnails or not isinstance(thumbnails, dict):
+        return ""
+
+    for key in ("high", "standard", "medium", "default"):
+        entry = thumbnails.get(key)
+        if isinstance(entry, dict) and entry.get("url"):
+            return entry["url"]
+
+    # Fallback: return the first URL we can find
+    for entry in thumbnails.values():
+        if isinstance(entry, dict) and entry.get("url"):
+            return entry["url"]
+
+    return ""
 
 def download_audio_sync(video_id: str) -> str:
     """Synchronous download using yt-dlp with cookies support."""
@@ -264,7 +400,7 @@ async def search_song(
             title=snippet["title"],
             videoId=video_id,
             channelTitle=snippet["channelTitle"],
-            thumbnail=snippet["thumbnails"]["high"]["url"],
+            thumbnail=get_thumbnail_url(snippet.get("thumbnails", {})),
             duration=duration
         ))
 
@@ -317,5 +453,235 @@ async def download_audio(
         filename=os.path.basename(filename),
         headers={"Content-Disposition": f"attachment; filename={os.path.basename(filename)}"}
     )
+
+@app.get("/search_playlists", response_model=PlaylistSearchResponse, tags=["Search"])
+@limiter.limit(Config.SEARCH_RATE_LIMIT)
+async def search_playlists(
+    request: Request,
+    query: str = Query(..., description="Search query for playlists", min_length=1)
+):
+    """
+    Search for playlists on YouTube.
+    
+    - **query**: Search term (e.g., artist name + "album" or playlist title)
+    - Returns up to 5 playlist results with metadata
+    """
+    logger.info(f"Playlist search request: '{query}' from {get_remote_address(request)}")
+    
+    try:
+        search_request = youtube_service.search().list(
+            part="snippet",  # pylint: disable=no-member
+            q=query,
+            maxResults=Config.MAX_SEARCH_RESULTS,
+            type="playlist",
+        )
+        response = search_request.execute()
+    except HttpError as e:
+        logger.error(f"YouTube API error during playlist search: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="YouTube API service temporarily unavailable"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error during playlist search: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    playlists = []
+    for item in response.get("items", []):
+        playlist_id = item["id"]["playlistId"]
+        snippet = item["snippet"]
+        
+        # Get video count from playlist details
+        try:
+            playlist_details = youtube_service.playlists().list(
+                part="contentDetails",
+                id=playlist_id
+            ).execute()
+            
+            video_count = playlist_details.get("items", [{}])[0].get("contentDetails", {}).get("itemCount", "0")
+        except Exception:
+            video_count = "0"
+
+        playlists.append(PlaylistInfo(
+            title=snippet["title"],
+            playlistId=playlist_id,
+            channelTitle=snippet["channelTitle"],
+            thumbnail=get_thumbnail_url(snippet.get("thumbnails", {})),
+            videoCount=str(video_count)
+        ))
+
+    return PlaylistSearchResponse(playlists=playlists, query=query, count=len(playlists))
+
+async def fetch_playlist_videos(playlist_id: str):
+    """Helper function to fetch all videos from a playlist."""
+    logger.info(f"Fetching videos from playlist {playlist_id}")
+    
+    try:
+        videos = []
+        next_page_token = None
+        
+        while True:
+            request_obj = youtube_service.playlistItems().list(
+                part="snippet,contentDetails",
+                playlistId=playlist_id,
+                maxResults=50,
+                pageToken=next_page_token
+            )
+            response = request_obj.execute()
+            
+            for item in response.get("items", []):
+                video_id = item["contentDetails"]["videoId"]
+                snippet = item["snippet"]
+                videos.append({
+                    "videoId": video_id,
+                    "title": snippet["title"],
+                    "channelTitle": snippet["channelTitle"],
+                    "thumbnail": snippet["thumbnails"]["high"]["url"]
+                })
+            
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+        
+        return {"videos": videos, "count": len(videos)}
+    
+    except HttpError as e:
+        logger.error(f"YouTube API error: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching playlist videos: {e}")
+        raise
+
+@app.get("/playlist_videos/{playlist_id}", tags=["Search"])
+@limiter.limit(Config.SEARCH_RATE_LIMIT)
+async def get_playlist_videos(
+    request: Request,
+    playlist_id: str
+):
+    """
+    Get all video IDs from a playlist.
+    
+    - **playlist_id**: YouTube playlist ID
+    - Returns list of video IDs
+    """
+    try:
+        return await fetch_playlist_videos(playlist_id)
+    except HttpError as e:
+        logger.error(f"YouTube API error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="YouTube API service temporarily unavailable"
+        )
+    except Exception as e:
+        logger.error(f"Error fetching playlist videos: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+async def download_and_process_playlist(
+    playlist_id: str, 
+    title: str, 
+    thumbnail: str, 
+    channel_title: str
+):
+    """Background task to download a playlist."""
+    try:
+        # Get all video IDs from the playlist
+        videos_response = await fetch_playlist_videos(playlist_id)
+        video_ids = [v["videoId"] for v in videos_response["videos"]]
+        
+        if not video_ids:
+            logger.warning(f"Playlist {playlist_id} has no videos")
+            return
+        
+        # Create temp directory for downloads
+        temp_dir = tempfile.mkdtemp(dir=Config.DOWNLOAD_DIR)
+        
+        # Download all songs
+        downloaded_files = await task_manager.download_playlist_songs(
+            playlist_id, video_ids, temp_dir
+        )
+        
+        # Add each downloaded song to the playlist
+        for vid_data, file_path in zip(videos_response["videos"], downloaded_files):
+            if file_path:
+                song_data = {
+                    "title": vid_data["title"],
+                    "channel_title": vid_data["channelTitle"],
+                    "thumbnail": vid_data["thumbnail"],
+                    "video_id": vid_data["videoId"],
+                    "file_path": file_path,
+                    "downloaded_at": datetime.now().isoformat()
+                }
+                playlist_storage.add_song_to_playlist(playlist_id, song_data)
+        
+        # Mark playlist as complete
+        playlist_storage.complete_playlist(playlist_id)
+        logger.info(f"Playlist {playlist_id} download completed")
+    
+    except Exception as e:
+        logger.error(f"Error downloading playlist {playlist_id}: {e}")
+        if playlist_id in playlist_storage._playlists:
+            playlist_storage._playlists[playlist_id]["status"] = "failed"
+            playlist_storage._save()
+
+@app.post("/download_playlist", tags=["Download"])
+@limiter.limit(Config.DOWNLOAD_RATE_LIMIT)
+async def download_playlist(
+    request: Request,
+    download_request: PlaylistDownloadRequest
+):
+    """
+    Start downloading a playlist.
+    
+    - Creates a new playlist entry
+    - Starts background download of all songs
+    - Returns immediately with playlist info
+    
+    Downloads happen in background with concurrent limit (2-3 at a time).
+    """
+    logger.info(f"Playlist download request for '{download_request.title}'")
+    
+    # Create playlist entry
+    playlist_storage.create_playlist(
+        download_request.playlist_id,
+        download_request.title,
+        download_request.thumbnail,
+        download_request.channel_title
+    )
+    
+    # Start background download task
+    asyncio.create_task(download_and_process_playlist(
+        download_request.playlist_id,
+        download_request.title,
+        download_request.thumbnail,
+        download_request.channel_title
+    ))
+    
+    return {
+        "status": "started",
+        "playlist_id": download_request.playlist_id,
+        "message": "Playlist download started in background"
+    }
+
+@app.get("/playlist_status/{playlist_id}", tags=["Download"])
+async def get_playlist_status(playlist_id: str):
+    """
+    Get the current status of a playlist download.
+    """
+    playlist = playlist_storage.get_playlist(playlist_id)
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    
+    return {
+        "playlist_id": playlist_id,
+        "title": playlist["title"],
+        "status": playlist["status"],
+        "songs_count": len(playlist.get("songs", [])),
+        "created_at": playlist["created_at"]
+    }
+
+@app.get("/downloads", tags=["Download"])
+async def get_all_downloads():
+    """Get all downloaded playlists."""
+    return {"playlists": playlist_storage.get_all_playlists()}
 
 # Run with: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
