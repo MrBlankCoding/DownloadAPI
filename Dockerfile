@@ -30,4 +30,5 @@ EXPOSE 8000
 ENV YOUTUBE_COOKIES=www.youtube.com_cookies.txt
 
 # Start the application with Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Your fucking shitting me
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
