@@ -186,6 +186,13 @@ task_manager = DownloadTaskManager(max_concurrent=2)
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up Music Downloader API...")
+    global youtube_service
+    try:
+        youtube_service = build("youtube", "v3", developerKey=Config.YOUTUBE_API_KEY)
+        logger.info("YouTube service initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize YouTube service: {e}")
+        raise
     yield
     # Shutdown
     logger.info("Shutting down... cleaning up resources")
@@ -208,12 +215,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize services
-try:
-    youtube_service = build("youtube", "v3", developerKey=Config.YOUTUBE_API_KEY)
-except Exception as e:
-    logger.error(f"Failed to initialize YouTube service: {e}")
-    raise
+# YouTube service will be initialized in lifespan
+youtube_service = None
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
