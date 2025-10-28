@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi import FastAPI, Query, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from googleapiclient.discovery import build
@@ -148,16 +148,28 @@ class DownloadTaskManager:
         self.tasks = {}
         self.semaphore = asyncio.Semaphore(max_concurrent)
     
-    async def download_playlist_songs(self, playlist_id: str, video_ids: List[str], temp_dir: str):
+    async def download_playlist_songs(self, playlist_id: str, video_ids: List[str], temp_dir: str, websocket_manager=None):
         """Download playlist songs with concurrency control."""
         completed = 0
         total = len(video_ids)
         
         async def download_with_limit(video_id: str, index: int):
+            nonlocal completed
             async with self.semaphore:
                 try:
                     url = f"https://www.youtube.com/watch?v={video_id}"
                     logger.info(f"Downloading song {index+1}/{total} from playlist {playlist_id}")
+                    
+                    # Send progress update
+                    if websocket_manager:
+                        await websocket_manager.broadcast(json.dumps({
+                            "type": "playlist_progress",
+                            "playlist_id": playlist_id,
+                            "current": index + 1,
+                            "total": total,
+                            "status": "downloading",
+                            "message": f"Downloading song {index+1} of {total}"
+                        }))
                     
                     ydl_opts = get_ydl_options(temp_dir)
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -165,10 +177,32 @@ class DownloadTaskManager:
                         base_filename = ydl.prepare_filename(info)
                         filename = os.path.splitext(base_filename)[0] + ".mp3"
                     
-                    logger.info(f"Completed download {index+1}/{total}: {filename}")
+                    completed += 1
+                    logger.info(f"Completed download {completed}/{total}: {filename}")
+                    
+                    # Send completion update for this song
+                    if websocket_manager:
+                        await websocket_manager.broadcast(json.dumps({
+                            "type": "song_completed",
+                            "playlist_id": playlist_id,
+                            "completed": completed,
+                            "total": total,
+                            "video_id": video_id,
+                            "song_title": info.get('title', 'Unknown'),
+                            "message": f"Downloaded: {info.get('title', 'Unknown')}"
+                        }))
+                    
                     return filename
                 except Exception as e:
                     logger.error(f"Download failed for {video_id}: {e}")
+                    if websocket_manager:
+                        await websocket_manager.broadcast(json.dumps({
+                            "type": "song_failed",
+                            "playlist_id": playlist_id,
+                            "video_id": video_id,
+                            "error": str(e),
+                            "message": f"Failed to download song {index+1}"
+                        }))
                     return None
         
         tasks = [download_with_limit(vid, idx) for idx, vid in enumerate(video_ids)]
@@ -178,6 +212,40 @@ class DownloadTaskManager:
 
 playlist_storage = PlaylistStorage()
 task_manager = DownloadTaskManager(max_concurrent=2)
+
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        try:
+            await websocket.send_text(message)
+        except:
+            self.disconnect(websocket)
+
+    async def broadcast(self, message: str):
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                logger.error(f"Failed to send WebSocket message: {e}")
+                disconnected.append(connection)
+        
+        # Remove disconnected connections
+        for connection in disconnected:
+            self.disconnect(connection)
+
+manager = ConnectionManager()
 
 # Lifespan context manager for cleanup
 @asynccontextmanager
@@ -595,20 +663,34 @@ async def download_and_process_playlist(
 ):
     """Background task to download a playlist."""
     try:
+        # Send playlist start message
+        await manager.broadcast(json.dumps({
+            "type": "playlist_started",
+            "playlist_id": playlist_id,
+            "title": title,
+            "message": f"Started downloading playlist: {title}"
+        }))
+        
         # Get all video IDs from the playlist
         videos_response = await fetch_playlist_videos(playlist_id)
         video_ids = [v["videoId"] for v in videos_response["videos"]]
         
         if not video_ids:
             logger.warning(f"Playlist {playlist_id} has no videos")
+            await manager.broadcast(json.dumps({
+                "type": "playlist_failed",
+                "playlist_id": playlist_id,
+                "error": "No videos found in playlist",
+                "message": f"Playlist {title} has no videos"
+            }))
             return
         
         # Create temp directory for downloads
         temp_dir = tempfile.mkdtemp(dir=Config.DOWNLOAD_DIR)
         
-        # Download all songs
+        # Download all songs with WebSocket updates
         downloaded_files = await task_manager.download_playlist_songs(
-            playlist_id, video_ids, temp_dir
+            playlist_id, video_ids, temp_dir, manager
         )
         
         # Add each downloaded song to the playlist
@@ -627,12 +709,31 @@ async def download_and_process_playlist(
         # Mark playlist as complete
         playlist_storage.complete_playlist(playlist_id)
         logger.info(f"Playlist {playlist_id} download completed")
+        
+        # Send playlist completion message
+        await manager.broadcast(json.dumps({
+            "type": "playlist_completed",
+            "playlist_id": playlist_id,
+            "title": title,
+            "total_songs": len(downloaded_files),
+            "successful_downloads": len([f for f in downloaded_files if f]),
+            "message": f"Playlist '{title}' download completed! {len([f for f in downloaded_files if f])} songs downloaded."
+        }))
     
     except Exception as e:
         logger.error(f"Error downloading playlist {playlist_id}: {e}")
         if playlist_id in playlist_storage._playlists:
             playlist_storage._playlists[playlist_id]["status"] = "failed"
             playlist_storage._save()
+        
+        # Send playlist failure message
+        await manager.broadcast(json.dumps({
+            "type": "playlist_failed",
+            "playlist_id": playlist_id,
+            "title": title,
+            "error": str(e),
+            "message": f"Failed to download playlist: {title}"
+        }))
 
 @app.post("/download_playlist", tags=["Download"])
 @limiter.limit(Config.DOWNLOAD_RATE_LIMIT)
@@ -695,4 +796,16 @@ async def get_all_downloads():
     """Get all downloaded playlists."""
     return {"playlists": playlist_storage.get_all_playlists()}
 
-# Run with: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time playlist download updates."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive and listen for any messages
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+# uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# ngrok http --domain=lasandra-sultriest-bumblingly.ngrok-free.dev 8000
